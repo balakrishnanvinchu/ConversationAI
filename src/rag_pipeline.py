@@ -1,16 +1,13 @@
 import os
-os.environ["TOKENIZERS_PARALLELISM"] = "false"
-os.environ["OMP_NUM_THREADS"] = "1"
-os.environ["MKL_NUM_THREADS"] = "1"
-
 import json
-import pickle
 import faiss
 import numpy as np
 from sentence_transformers import SentenceTransformer
+from rank_bm25 import BM25Okapi
 
-from src.rrf import rrf_fusion
-from src.generator import generate_answer
+os.environ["TOKENIZERS_PARALLELISM"] = "false"
+os.environ["OMP_NUM_THREADS"] = "1"
+os.environ["MKL_NUM_THREADS"] = "1"
 
 
 # ---------------- LOAD MODELS ----------------
@@ -20,42 +17,60 @@ model = SentenceTransformer(
     device="cpu"
 )
 
+
 # ---------------- LOAD DATA ----------------
 
 with open("data/corpus_chunks.json") as f:
     corpus = json.load(f)
 
-texts = [c["text"] for c in corpus]
+texts = [d["text"] for d in corpus]
 
-# Load FAISS index
+bm25 = BM25Okapi([t.split() for t in texts])
+
+
+# ---------------- LOAD FAISS ----------------
+
 index = faiss.read_index("data/faiss.index")
 
-if not index.is_trained:
-    raise RuntimeError("FAISS index not trained")
-
-# Load BM25
-with open("data/bm25.pkl", "rb") as f:
-    bm25 = pickle.load(f)
+print("FAISS index dimension:", index.d)
 
 
-# ---------------- RAG PIPELINE ----------------
+# ---------------- RRF ----------------
+
+def rrf_fusion(dense_ids, sparse_results, k=60):
+
+    scores = {}
+
+    for rank, idx in enumerate(dense_ids):
+        scores[idx] = scores.get(idx, 0) + 1 / (k + rank + 1)
+
+    for rank, (idx, _) in enumerate(sparse_results):
+        scores[idx] = scores.get(idx, 0) + 1 / (k + rank + 1)
+
+    return sorted(scores.items(), key=lambda x: x[1], reverse=True)
+
+
+# ---------------- MAIN PIPELINE ----------------
 
 def run_rag(query, top_k=10, final_k=5):
 
     if not query.strip():
         raise ValueError("Empty query")
 
-    # ---------- Dense Retrieval ----------
+    # -------- Dense Retrieval --------
 
-    q_emb = model.encode(
-        query,
-        convert_to_numpy=True,
-        normalize_embeddings=True
-    ).reshape(1, -1)
+    q_emb = model.encode(query)
+
+    q_emb = np.array(q_emb).astype("float32").reshape(1, -1)
+
+    faiss.normalize_L2(q_emb)
+
+    print("Query dim:", q_emb.shape)
 
     dense_scores, dense_ids = index.search(q_emb, top_k)
 
     dense_results = []
+
     for rank, (idx, score) in enumerate(zip(dense_ids[0], dense_scores[0])):
         dense_results.append({
             "rank": rank + 1,
@@ -64,17 +79,19 @@ def run_rag(query, top_k=10, final_k=5):
             "score": float(score)
         })
 
-    # ---------- Sparse Retrieval ----------
 
-    scores = bm25.get_scores(query.split())
+    # -------- Sparse Retrieval --------
+
+    bm25_scores = bm25.get_scores(query.split())
 
     sparse_top = sorted(
-        enumerate(scores),
+        enumerate(bm25_scores),
         key=lambda x: x[1],
         reverse=True
     )[:top_k]
 
     sparse_results = []
+
     for rank, (idx, score) in enumerate(sparse_top):
         sparse_results.append({
             "rank": rank + 1,
@@ -83,11 +100,13 @@ def run_rag(query, top_k=10, final_k=5):
             "score": float(score)
         })
 
-    # ---------- RRF Fusion ----------
+
+    # -------- RRF Fusion --------
 
     fused = rrf_fusion(dense_ids[0], sparse_top)
 
     rrf_results = []
+
     for idx, score in fused:
         rrf_results.append({
             "chunk": texts[idx],
@@ -95,20 +114,24 @@ def run_rag(query, top_k=10, final_k=5):
             "rrf_score": float(score)
         })
 
-    # ---------- Final Context ----------
 
-    contexts = [item["chunk"] for item in rrf_results[:final_k]]
-    sources = [item["url"] for item in rrf_results[:final_k]]
+    # -------- Final Context --------
 
-    # ---------- Answer Generation ----------
+    final_context = rrf_results[:final_k]
 
-    answer = generate_answer(query, contexts)
+    contexts = [item["chunk"] for item in final_context]
+    sources = [item["url"] for item in final_context]
 
-    # ---------- Return ----------
+
+    # -------- Simple Answer (safe fallback) --------
+
+    answer = contexts[0][:400] if contexts else "No relevant answer found."
+
 
     return {
         "answer": answer,
         "sources": sources,
+        "final_context": final_context,
         "dense_results": dense_results,
         "sparse_results": sparse_results,
         "rrf_results": rrf_results

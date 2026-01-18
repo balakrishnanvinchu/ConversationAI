@@ -43,6 +43,7 @@ dim = embeddings.shape[1]
 
 index = faiss.IndexFlatIP(dim)
 index.add(embeddings)
+print("FAISS INDEX DIMENSION:", index.d)
 
 faiss.write_index(index, "data/faiss.index")
 np.save("data/embeddings.npy", embeddings)
